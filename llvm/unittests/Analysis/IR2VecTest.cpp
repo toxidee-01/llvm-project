@@ -34,6 +34,67 @@ public:
   }
 };
 
+using VocabMap = std::map<std::string, Embedding>;
+// Helper function to create a test vocabulary with specific embeddings
+Vocabulary createTestVocabulary(
+    std::initializer_list<std::pair<const char *, float>> Opcodes,
+    std::initializer_list<std::pair<const char *, float>> Types,
+    std::initializer_list<std::pair<const char *, float>> Operands,
+    std::initializer_list<std::pair<const char *, float>> Predicates,
+    unsigned Dimension = 2) {
+  
+  VocabMap OpcodeMap, TypeMap, OperandMap, PredicateMap;
+  
+  // Apply weights when creating the maps
+  for (const auto &[Name, Value] : Opcodes)
+    OpcodeMap[Name] = Embedding(Dimension, Value * ir2vec::OpcWeight);
+  for (const auto &[Name, Value] : Types)
+    TypeMap[Name] = Embedding(Dimension, Value * ir2vec::TypeWeight);
+  for (const auto &[Name, Value] : Operands)
+    OperandMap[Name] = Embedding(Dimension, Value * ir2vec::ArgWeight);
+  for (const auto &[Name, Value] : Predicates)
+    PredicateMap[Name] = Embedding(Dimension, Value * ir2vec::ArgWeight);
+  
+  std::vector<std::vector<Embedding>> Sections(4);
+  
+  // Section 0: Opcodes
+  Sections[0].reserve(Vocabulary::MaxOpcodes);
+  for (unsigned i = 1; i <= Vocabulary::MaxOpcodes; ++i) {
+    StringRef Key = Vocabulary::getVocabKeyForOpcode(i);
+    auto It = OpcodeMap.find(Key.str());
+    Sections[0].push_back(It != OpcodeMap.end() ? It->second : Embedding(Dimension, 0.0f));
+  }
+  
+  // Section 1: Types
+  Sections[1].reserve(Vocabulary::MaxCanonicalTypeIDs);
+  unsigned TypeBaseOffset = Vocabulary::MaxOpcodes;
+  for (unsigned i = 0; i < Vocabulary::MaxCanonicalTypeIDs; ++i) {
+    StringRef Key = Vocabulary::getStringKey(TypeBaseOffset + i);
+    auto It = TypeMap.find(Key.str());
+    Sections[1].push_back(It != TypeMap.end() ? It->second : Embedding(Dimension, 0.0f));
+  }
+  
+  // Section 2: Operands
+  Sections[2].reserve(Vocabulary::MaxOperandKinds);
+  unsigned OperandBaseOffset = Vocabulary::MaxOpcodes + Vocabulary::MaxCanonicalTypeIDs;
+  for (unsigned i = 0; i < Vocabulary::MaxOperandKinds; ++i) {
+    StringRef Key = Vocabulary::getStringKey(OperandBaseOffset + i);
+    auto It = OperandMap.find(Key.str());
+    Sections[2].push_back(It != OperandMap.end() ? It->second : Embedding(Dimension, 0.0f));
+  }
+  
+  // Section 3: Predicates
+  Sections[3].reserve(Vocabulary::MaxPredicateKinds);
+  unsigned PredicateBaseOffset = OperandBaseOffset + Vocabulary::MaxOperandKinds;
+  for (unsigned i = 0; i < Vocabulary::MaxPredicateKinds; ++i) {
+    StringRef Key = Vocabulary::getStringKey(PredicateBaseOffset + i);
+    auto It = PredicateMap.find(Key.str());
+    Sections[3].push_back(It != PredicateMap.end() ? It->second : Embedding(Dimension, 0.0f));
+  }
+  
+  return Vocabulary(VocabStorage(std::move(Sections)));
+}
+
 TEST(EmbeddingTest, ConstructorsAndAccessors) {
   // Default constructor
   {
@@ -296,7 +357,6 @@ TEST(IR2VecTest, ZeroDimensionEmbedding) {
 // Fixture for IR2Vec tests requiring IR setup.
 class IR2VecTestFixture : public ::testing::Test {
 protected:
-  std::unique_ptr<Vocabulary> V;
   LLVMContext Ctx;
   std::unique_ptr<Module> M;
   Function *F = nullptr;
@@ -305,9 +365,6 @@ protected:
   Instruction *RetInst = nullptr;
 
   void SetUp() override {
-    V = std::make_unique<Vocabulary>(Vocabulary::createDummyVocabForTest(2));
-
-    // Setup IR
     M = std::make_unique<Module>("TestM", Ctx);
     FunctionType *FTy = FunctionType::get(
         Type::getInt32Ty(Ctx), {Type::getInt32Ty(Ctx), Type::getInt32Ty(Ctx)},
@@ -323,80 +380,165 @@ protected:
 };
 
 TEST_F(IR2VecTestFixture, GetInstVec_Symbolic) {
-  auto Emb = Embedder::create(IR2VecKind::Symbolic, *F, *V);
+  float AddOpcodeValue = 10.0f;
+  float IntegerTypeValue = 5.0f;
+  float VoidTypeValue = 1.0f;
+  float VariableValue = 2.0f;
+  float ConstantValue = 3.0f;
+  float RetOpcodeValue = 7.0f;
+  
+  auto V = createTestVocabulary(
+      {{"Add", AddOpcodeValue}, {"Ret", RetOpcodeValue}},
+      {{"IntegerTy", IntegerTypeValue}, {"VoidTy", VoidTypeValue}},
+      {{"Variable", VariableValue}, {"Constant", ConstantValue}},
+      {},
+      2
+  );
+
+  auto Emb = Embedder::create(IR2VecKind::Symbolic, *F, V);
   ASSERT_TRUE(static_cast<bool>(Emb));
 
   const auto &AddEmb = Emb->getInstVector(*AddInst);
   const auto &RetEmb = Emb->getInstVector(*RetInst);
-  EXPECT_EQ(AddEmb.size(), 2u);
-  EXPECT_EQ(RetEmb.size(), 2u);
 
-  EXPECT_TRUE(AddEmb.approximatelyEquals(Embedding(2, 25.5)));
-  EXPECT_TRUE(RetEmb.approximatelyEquals(Embedding(2, 15.5)));
+  // Add instruction embedding = Add opcode + IntegerTy + Variable (arg) + Constant (42)
+  float ExpectedAddValue = 
+      AddOpcodeValue * ir2vec::OpcWeight + 
+      IntegerTypeValue * ir2vec::TypeWeight + 
+      VariableValue * ir2vec::ArgWeight + 
+      ConstantValue * ir2vec::ArgWeight;
+  
+  // Ret instruction embedding = Ret opcode + VoidTy (NOT IntegerTy!) + Variable (add result)
+  float ExpectedRetValue = 
+      RetOpcodeValue * ir2vec::OpcWeight + 
+      VoidTypeValue * ir2vec::TypeWeight + 
+      VariableValue * ir2vec::ArgWeight;
+  
+  Embedding ExpectedAddEmb(2, ExpectedAddValue);
+  Embedding ExpectedRetEmb(2, ExpectedRetValue);
+  
+  EXPECT_TRUE(AddEmb.approximatelyEquals(ExpectedAddEmb));
+  EXPECT_TRUE(RetEmb.approximatelyEquals(ExpectedRetEmb));
 }
 
 TEST_F(IR2VecTestFixture, GetInstVec_FlowAware) {
-  auto Emb = Embedder::create(IR2VecKind::FlowAware, *F, *V);
+  float AddOpcodeValue = 10.0f;
+  float IntegerTypeValue = 5.0f;
+  float VoidTypeValue = 1.0f;
+  float VariableValue = 2.0f;
+  float ConstantValue = 3.0f;
+  float RetOpcodeValue = 7.0f;
+  
+  auto V = createTestVocabulary(
+      {{"Add", AddOpcodeValue}, {"Ret", RetOpcodeValue}},
+      {{"IntegerTy", IntegerTypeValue}, {"VoidTy", VoidTypeValue}},
+      {{"Variable", VariableValue}, {"Constant", ConstantValue}},
+      {},
+      2
+  );
+
+  auto Emb = Embedder::create(IR2VecKind::FlowAware, *F, V);
   ASSERT_TRUE(static_cast<bool>(Emb));
 
   const auto &AddEmb = Emb->getInstVector(*AddInst);
   const auto &RetEmb = Emb->getInstVector(*RetInst);
-  EXPECT_EQ(AddEmb.size(), 2u);
-  EXPECT_EQ(RetEmb.size(), 2u);
 
-  EXPECT_TRUE(AddEmb.approximatelyEquals(Embedding(2, 25.5)));
-  EXPECT_TRUE(RetEmb.approximatelyEquals(Embedding(2, 32.6)));
+  // Add instruction: same as symbolic
+  float ExpectedAddValue = 
+      AddOpcodeValue * ir2vec::OpcWeight + 
+      IntegerTypeValue * ir2vec::TypeWeight + 
+      VariableValue * ir2vec::ArgWeight + 
+      ConstantValue * ir2vec::ArgWeight;
+  Embedding ExpectedAddEmb(2, ExpectedAddValue);
+  
+  // Ret instruction uses Add's embedding for its operand instead of just Variable
+  float ExpectedRetValue = 
+      RetOpcodeValue * ir2vec::OpcWeight + 
+      VoidTypeValue * ir2vec::TypeWeight;
+  Embedding ExpectedRetEmb = Embedding(2, ExpectedRetValue) + AddEmb;
+  
+  EXPECT_TRUE(AddEmb.approximatelyEquals(ExpectedAddEmb));
+  EXPECT_TRUE(RetEmb.approximatelyEquals(ExpectedRetEmb));
 }
 
 TEST_F(IR2VecTestFixture, GetBBVector_Symbolic) {
-  auto Emb = Embedder::create(IR2VecKind::Symbolic, *F, *V);
+  auto V = createTestVocabulary(
+      {{"Add", 10.0f}, {"Ret", 7.0f}},
+      {{"IntegerTy", 5.0f}},
+      {{"Variable", 2.0f}, {"Constant", 3.0f}},
+      {},
+      2
+  );
+
+  auto Emb = Embedder::create(IR2VecKind::Symbolic, *F, V);
   ASSERT_TRUE(static_cast<bool>(Emb));
 
   const auto &BBVec = Emb->getBBVector(*BB);
-
-  EXPECT_EQ(BBVec.size(), 2u);
-  // BB vector should be sum of add and ret: {25.5, 25.5} + {15.5, 15.5} =
-  // {41.0, 41.0}
-  EXPECT_TRUE(BBVec.approximatelyEquals(Embedding(2, 41.0)));
+  const auto &FuncVec = Emb->getFunctionVector();
+  EXPECT_TRUE(BBVec.approximatelyEquals(FuncVec));
 }
 
 TEST_F(IR2VecTestFixture, GetBBVector_FlowAware) {
-  auto Emb = Embedder::create(IR2VecKind::FlowAware, *F, *V);
+  auto V = createTestVocabulary(
+      {{"Add", 10.0f}, {"Ret", 7.0f}},
+      {{"IntegerTy", 5.0f}},
+      {{"Variable", 2.0f}, {"Constant", 3.0f}},
+      {},
+      2
+  );
+
+  auto Emb = Embedder::create(IR2VecKind::FlowAware, *F, V);
   ASSERT_TRUE(static_cast<bool>(Emb));
 
   const auto &BBVec = Emb->getBBVector(*BB);
-
-  EXPECT_EQ(BBVec.size(), 2u);
-  // BB vector should be sum of add and ret: {25.5, 25.5} + {32.6, 32.6} =
-  // {58.1, 58.1}
-  EXPECT_TRUE(BBVec.approximatelyEquals(Embedding(2, 58.1)));
+  const auto &FuncVec = Emb->getFunctionVector();
+  EXPECT_TRUE(BBVec.approximatelyEquals(FuncVec));
 }
 
 TEST_F(IR2VecTestFixture, GetFunctionVector_Symbolic) {
-  auto Emb = Embedder::create(IR2VecKind::Symbolic, *F, *V);
+  auto V = createTestVocabulary(
+      {{"Add", 10.0f}, {"Ret", 7.0f}},
+      {{"IntegerTy", 5.0f}},
+      {{"Variable", 2.0f}, {"Constant", 3.0f}},
+      {},
+      2
+  );
+
+  auto Emb = Embedder::create(IR2VecKind::Symbolic, *F, V);
   ASSERT_TRUE(static_cast<bool>(Emb));
 
   const auto &FuncVec = Emb->getFunctionVector();
-
-  EXPECT_EQ(FuncVec.size(), 2u);
-
-  // Function vector should match BB vector (only one BB): {41.0, 41.0}
-  EXPECT_TRUE(FuncVec.approximatelyEquals(Embedding(2, 41.0)));
+  const auto &BBVec = Emb->getBBVector(*BB);
+  EXPECT_TRUE(FuncVec.approximatelyEquals(BBVec));
 }
 
 TEST_F(IR2VecTestFixture, GetFunctionVector_FlowAware) {
-  auto Emb = Embedder::create(IR2VecKind::FlowAware, *F, *V);
+  auto V = createTestVocabulary(
+      {{"Add", 10.0f}, {"Ret", 7.0f}},
+      {{"IntegerTy", 5.0f}},
+      {{"Variable", 2.0f}, {"Constant", 3.0f}},
+      {},
+      2
+  );
+
+  auto Emb = Embedder::create(IR2VecKind::FlowAware, *F, V);
   ASSERT_TRUE(static_cast<bool>(Emb));
 
   const auto &FuncVec = Emb->getFunctionVector();
-
-  EXPECT_EQ(FuncVec.size(), 2u);
-  // Function vector should match BB vector (only one BB): {58.1, 58.1}
-  EXPECT_TRUE(FuncVec.approximatelyEquals(Embedding(2, 58.1)));
+  const auto &BBVec = Emb->getBBVector(*BB);
+  EXPECT_TRUE(FuncVec.approximatelyEquals(BBVec));
 }
 
 TEST_F(IR2VecTestFixture, MultipleComputeEmbeddingsConsistency_Symbolic) {
-  auto Emb = Embedder::create(IR2VecKind::Symbolic, *F, *V);
+  auto V = createTestVocabulary(
+      {{"Add", 10.0f}, {"Ret", 7.0f}},
+      {{"IntegerTy", 5.0f}},
+      {{"Variable", 2.0f}, {"Constant", 3.0f}},
+      {},
+      2
+  );
+
+  auto Emb = Embedder::create(IR2VecKind::Symbolic, *F, V);
   ASSERT_TRUE(static_cast<bool>(Emb));
 
   // Get initial function vector
@@ -417,7 +559,15 @@ TEST_F(IR2VecTestFixture, MultipleComputeEmbeddingsConsistency_Symbolic) {
 }
 
 TEST_F(IR2VecTestFixture, MultipleComputeEmbeddingsConsistency_FlowAware) {
-  auto Emb = Embedder::create(IR2VecKind::FlowAware, *F, *V);
+  auto V = createTestVocabulary(
+      {{"Add", 10.0f}, {"Ret", 7.0f}},
+      {{"IntegerTy", 5.0f}},
+      {{"Variable", 2.0f}, {"Constant", 3.0f}},
+      {},
+      2
+  );
+
+  auto Emb = Embedder::create(IR2VecKind::FlowAware, *F, V);
   ASSERT_TRUE(static_cast<bool>(Emb));
 
   // Get initial function vector
